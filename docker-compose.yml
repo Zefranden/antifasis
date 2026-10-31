@@ -1,0 +1,22 @@
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: antifasis-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: antifasis
+      POSTGRES_USER: antifasis
+      POSTGRES_PASSWORD: antifasis
+      TZ: Europe/Madrid
+    ports:
+      - "5432:5432"
+    volumes:
+      - antifasis_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U antifasis -d antifasis"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  antifasis_pgdata:
