@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "antifasis"
-version = "1.0.0"
+version = "1.1.0"
 description = "Agregador de titulares y noticias de los 20 principales medios españoles, con almacenamiento en PostgreSQL por fecha."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,6 +14,8 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "charset-normalizer>=3.0",
     "feedparser>=6.0.11",
+    "Flask>=3.0",
+    "gunicorn>=21.2",
     "psycopg[binary]>=3.1",
     "requests>=2.31",
     "tzdata>=2023.3",

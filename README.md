@@ -12,6 +12,7 @@ El programa no descarga el texto completo de las noticias: guarda el titular, el
 - **Deduplicación por URL canónica** y `UPSERT` idempotente: ejecutar dos veces no duplica noticias.
 - **Fecha civil en Europe/Madrid** (`fecha`), instante exacto en UTC (`fecha_publicacion`) y marca de fecha estimada.
 - **CLI**: inicializar la base, actualizar, resumir por día, exportar a CSV/JSONL y borrar datos antiguos.
+- **API Flask** protegida por token para lanzar la captura desde Render o cualquier cron mediante `POST /actualizar`.
 - **robots.txt**, reintentos con espera exponencial, límite de tamaño y user-agent identificable.
 - **Pruebas unitarias** y una prueba de integración opcional contra PostgreSQL.
 
@@ -156,6 +157,68 @@ python -m antifasis mantener --dias 365 --simular
 python -m antifasis mantener --dias 365 --capturas-dias 90 --si
 ```
 
+## API HTTP
+
+La misma lógica de extracción se puede ejecutar desde una API Flask. La API está pensada para recibir una llamada de cron y ejecutar la captura de forma síncrona.
+
+| Método | Ruta | Autenticación | Descripción |
+|---|---|---|---|
+| `GET` | `/` | No | Información básica y rutas disponibles. |
+| `GET` | `/health` | No | Estado del servicio; pensado para el health check de Render. |
+| `GET` | `/health/db` | No | Comprueba conexión y esquema de PostgreSQL. |
+| `POST` | `/actualizar` | Bearer token | Ejecuta la captura y devuelve el resumen. |
+| `GET` | `/resumen` | Bearer token | Resumen por fecha o rango. |
+
+El token se configura en `ANTIFASIS_API_TOKEN`. Si no está definido, los endpoints protegidos responden `503`; si el token no coincide, responden `401`. No hay ningún endpoint de escritura sin autenticar.
+
+### Ejecutar en local
+
+```bash
+export ANTIFASIS_API_TOKEN="dev-token"
+python -m antifasis.api
+```
+
+En otra terminal:
+
+```bash
+curl -X POST http://127.0.0.1:8000/actualizar \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+También se puede limitar la ejecución:
+
+```bash
+curl -X POST http://127.0.0.1:8000/actualizar \
+  -H "Authorization: Bearer dev-token" \
+  -H "Content-Type: application/json" \
+  -d '{"medios": ["elpais", "elconfidencial"], "limite": 20, "dias_max": 7}'
+```
+
+Cuerpo admitido:
+
+| Campo | Tipo | Efecto |
+|---|---|---|
+| `medios` | lista de claves | Limita la captura a esos medios. |
+| `limite` | entero 0-500 | Máximo de noticias por medio. |
+| `dias_max` | entero 0-3650 | Antigüedad máxima en días. |
+| `dry_run` | booleano | Extrae sin escribir en PostgreSQL. |
+
+La respuesta incluye `nuevas`, `actualizadas`, `recibidas`, `estados`, `fallos` y el detalle por medio. Si ya hay una ejecución en curso, `POST /actualizar` devuelve `409`.
+
+### Cron
+
+El repositorio incluye [`scripts/render_cron.sh`](scripts/render_cron.sh), que llama a `POST /actualizar` con el token y falla si la API devuelve un error:
+
+```bash
+export ANTIFASIS_API_HOST="antifasis-api.onrender.com"
+export ANTIFASIS_API_TOKEN="tu-token"
+bash scripts/render_cron.sh
+```
+
+Para un cron externo (cron-job.org, GitHub Actions, crontab, etc.) basta con hacer un `POST` a la URL pública con la cabecera `Authorization: Bearer ...`.
+
 ## Variables de entorno
 
 Se leen del entorno y, si existe, de un fichero `.env` en el directorio actual o en la raíz del proyecto.
@@ -171,6 +234,8 @@ Se leen del entorno y, si existe, de un fichero `.env` en el directorio actual o
 | `ANTIFASIS_DIAS_MAX` | `30` | Antigüedad máxima en días (`0` = sin límite). |
 | `ANTIFASIS_RESPETAR_ROBOTS` | `true` | Comprobar `robots.txt`. |
 | `ANTIFASIS_USER_AGENT` | navegador + `Antifasis/1.0` | User-agent de las peticiones. |
+| `ANTIFASIS_API_TOKEN` | vacío | Token de `POST /actualizar` y `GET /resumen`. |
+| `ANTIFASIS_AUTO_INIT` | `false` | Aplica el esquema y registra los medios al arrancar la API. |
 
 También puedes pasar la conexión por CLI, después del subcomando:
 
@@ -250,6 +315,53 @@ LEFT JOIN capturas c ON c.medio_id = m.id
 ORDER BY m.clave, c.iniciada_en DESC NULLS LAST;
 ```
 
+## Despliegue en Render + Supabase
+
+### 1. Base de datos en Supabase
+
+1. Crea un proyecto en Supabase y copia la cadena de conexión de **Project Settings → Database**.
+2. Si Render no tiene salida IPv6, usa la cadena del **Session pooler** o **Transaction pooler** (suele ser el host `*.pooler.supabase.com`).
+3. Define esa cadena como `DATABASE_URL` en Render. La aplicación añade `sslmode=require` automáticamente si detecta un host de Supabase y desactiva las sentencias preparadas para que funcione también con PgBouncer.
+4. La primera vez hay que crear las tablas. El `render.yaml` activa `ANTIFASIS_AUTO_INIT=true`, así que el propio arranque aplica [`antifasis/sql/esquema.sql`](antifasis/sql/esquema.sql) y registra los 20 medios. Si prefieres hacerlo a mano, ejecuta `python -m antifasis init-db` desde la Shell de Render.
+
+### 2. Repositorio
+
+El proyecto se publica en:
+
+- GitHub: <https://github.com/Zefranden/antifasis.git>
+- Forgejo local: `http://192.168.1.44:3000/administrador/antifasis.git`
+
+Render despliega desde GitHub, así que el repositorio de GitHub es el que debe estar conectado al Blueprint.
+
+### 3. Blueprint de Render
+
+El fichero [`render.yaml`](render.yaml) define dos recursos:
+
+- **`antifasis-api`**: servicio web Python con Gunicorn, health check en `/health` y arranque con `ANTIFASIS_AUTO_INIT=true`.
+- **`antifasis-cron`**: Cron Job que ejecuta `bash scripts/render_cron.sh` a las `06:00` y `18:00` UTC. Cambia `schedule` si quieres otra frecuencia.
+
+Al aplicar el Blueprint, Render pedirá el valor de `DATABASE_URL`. El token de API se genera automáticamente y el cron lo hereda del servicio web mediante `fromService`; también hereda el host público. Si cambias el nombre del servicio web, actualiza las referencias `fromService` del cron.
+
+Si tu plan no incluye Cron Jobs, crea un cron externo que haga:
+
+```bash
+curl -fsS -X POST "https://TU-SERVICIO.onrender.com/actualizar" \
+  -H "Authorization: Bearer TU_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+Los servicios gratuitos de Render se suspenden por inactividad: la primera llamada del cron puede tardar unos segundos en despertar el servicio. El `--max-time 240` del script deja margen suficiente.
+
+### 4. Comprobaciones tras desplegar
+
+```bash
+curl https://TU-SERVICIO.onrender.com/health
+curl https://TU-SERVICIO.onrender.com/health/db
+```
+
+La primera debe devolver `status: ok`; la segunda comprueba que el esquema está aplicado. Si `/health/db` falla, revisa `DATABASE_URL`, la contraseña y que hayas usado la cadena del pooler correcta.
+
 ## Programación automática
 
 El repositorio incluye [`scripts/cron_diario.sh`](scripts/cron_diario.sh), que ejecuta una captura y escribe el resultado en `logs/antifasis.log`.
@@ -294,10 +406,15 @@ antifasis/
   http.py          # reintentos, robots.txt, decodificación
   medios.py        # catálogo de los 20 medios
   modelos.py       # Noticia y ResultadoMedio
+  servicio.py      # extracción + persistencia compartida por CLI y API
+  api.py           # API Flask
   texto.py         # limpieza, URLs canónicas, secciones
   sql/esquema.sql
+wsgi.py            # entrada WSGI para Gunicorn/Render
+render.yaml        # web + cron job de Render
 tests/
 scripts/cron_diario.sh
+scripts/render_cron.sh
 docker-compose.yml
 ```
 

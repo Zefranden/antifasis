@@ -7,19 +7,17 @@ import csv
 import json
 import logging
 import sys
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, Optional, Sequence, Tuple
 
 from . import __version__
 from .config import Ajustes, ErrorConfiguracion, cargar_ajustes
 from .db import BaseDatos, ErrorBaseDatos, leer_esquema
-from .extractores import extraer_medio
 from .fechas import parsear_fecha_cli
-from .http import SesionHTTP
 from .medios import MEDIOS, ErrorMedio, seleccionar_medios
+from .servicio import actualizar as ejecutar_actualizacion
 from .modelos import ResultadoMedio
 
 LOG = logging.getLogger("antifasis")
@@ -148,6 +146,27 @@ def cmd_listar_medios(_ajustes: Ajustes, _args) -> int:
     return 0
 
 
+def _imprimir_progreso(
+    resultado: ResultadoMedio, completados: int, total: int, dry_run: bool
+) -> None:
+    etiqueta = f"[{completados:>2}/{total}]"
+    metodo = resultado.metodo or "-"
+    if dry_run:
+        contador = f"{resultado.total:>3} noticias"
+    else:
+        contador = (
+            f"{resultado.total:>3} noticias · {resultado.nuevas:>3} nuevas · "
+            f"{resultado.actualizadas:>3} act."
+        )
+    print(
+        f"{etiqueta} {resultado.medio.nombre[:26]:<26} {resultado.estado:<8} "
+        f"{metodo[:16]:<16} {contador:>34}  {_segundos(resultado.duracion_ms):>7}",
+        flush=True,
+    )
+    for error in resultado.errores[:2]:
+        print(f"         · {error[:150]}", flush=True)
+
+
 def cmd_actualizar(ajustes: Ajustes, args) -> int:
     medios = seleccionar_medios(args.medio)
 
@@ -174,104 +193,38 @@ def cmd_actualizar(ajustes: Ajustes, args) -> int:
     if args.dry_run:
         print("Modo simulación: no se escribirá en PostgreSQL.\n")
 
-    db: Optional[BaseDatos] = None
-    ids: Dict[str, int] = {}
-    if not args.dry_run:
-        db = BaseDatos(ajustes.database_url)
-        db.verificar_esquema()
-        ids = db.sincronizar_medios(medios)
+    def progreso(resultado: ResultadoMedio, completados: int, total: int) -> None:
+        _imprimir_progreso(resultado, completados, total, args.dry_run)
 
-    totales = {"nuevas": 0, "actualizadas": 0, "recibidas": 0}
-    estados: Dict[str, int] = {}
-    fallos: List[Tuple[str, str]] = []
-    completados = 0
-
-    try:
-        with SesionHTTP(ajustes) as cliente:
-            with ThreadPoolExecutor(max_workers=min(ajustes.workers, len(medios))) as pool:
-                futuros = {pool.submit(extraer_medio, medio, cliente, ajustes): medio for medio in medios}
-                for futuro in as_completed(futuros):
-                    medio = futuros[futuro]
-                    completados += 1
-                    try:
-                        resultado = futuro.result()
-                    except Exception as exc:  # noqa: BLE001 - aislamos cada medio
-                        LOG.exception("Fallo inesperado en %s", medio.clave)
-                        resultado = ResultadoMedio(
-                            medio=medio,
-                            estado="error",
-                            errores=[f"{type(exc).__name__}: {exc}"],
-                        )
-
-                    nuevas = 0
-                    actualizadas = 0
-                    captura_id: Optional[int] = None
-
-                    if db is not None:
-                        try:
-                            captura_id = db.iniciar_captura(
-                                ids[medio.clave], resultado.iniciada_en or datetime.now().astimezone()
-                            )
-                            nuevas, actualizadas = db.guardar_noticias(
-                                ids[medio.clave], resultado.noticias
-                            )
-                            db.finalizar_captura(captura_id, resultado, nuevas, actualizadas)
-                        except ErrorBaseDatos as exc:
-                            if captura_id is not None:
-                                db.marcar_captura_error(
-                                    captura_id, str(exc), resultado.duracion_ms
-                                )
-                            resultado.estado = "error"
-                            resultado.anotar_error(str(exc))
-                            fallos.append((medio.nombre, str(exc)))
-
-                    totales["nuevas"] += nuevas
-                    totales["actualizadas"] += actualizadas
-                    totales["recibidas"] += resultado.total
-                    estados[resultado.estado] = estados.get(resultado.estado, 0) + 1
-                    if resultado.estado == "error":
-                        fallos.append(
-                            (medio.nombre, resultado.error_resumen or "sin noticias")
-                        )
-
-                    etiqueta = f"[{completados:>2}/{len(medios)}]"
-                    metodo = resultado.metodo or "-"
-                    contador = (
-                        f"{resultado.total:>3} noticias"
-                        if args.dry_run
-                        else f"{resultado.total:>3} noticias · {nuevas:>3} nuevas · {actualizadas:>3} act."
-                    )
-                    print(
-                        f"{etiqueta} {medio.nombre[:26]:<26} {resultado.estado:<8} "
-                        f"{metodo[:16]:<16} {contador:>34}  {_segundos(resultado.duracion_ms):>7}",
-                        flush=True,
-                    )
-                    if resultado.errores:
-                        for error in resultado.errores[:2]:
-                            print(f"         · {error[:150]}", flush=True)
-    finally:
-        if db is not None:
-            db.cerrar()
+    resumen = ejecutar_actualizacion(
+        ajustes,
+        medios,
+        limite=limite,
+        dias_max=dias_max,
+        dry_run=args.dry_run,
+        progreso=progreso,
+    )
 
     print("\n" + "-" * 78)
-    if args.dry_run:
+    estados = ", ".join(f"{clave}={valor}" for clave, valor in sorted(resumen.estados.items()))
+    if resumen.dry_run:
         print(
-            f"Simulación: {_num(totales['recibidas'])} noticias en {len(medios)} medios · "
-            f"estados: {', '.join(f'{k}={v}' for k, v in sorted(estados.items()))}"
+            f"Simulación: {_num(resumen.recibidas)} noticias en {len(medios)} medios · "
+            f"estados: {estados}"
         )
     else:
         print(
-            f"Total: {_num(totales['recibidas'])} noticias · "
-            f"{_num(totales['nuevas'])} nuevas · {_num(totales['actualizadas'])} actualizadas · "
-            f"estados: {', '.join(f'{k}={v}' for k, v in sorted(estados.items()))}"
+            f"Total: {_num(resumen.recibidas)} noticias · "
+            f"{_num(resumen.nuevas)} nuevas · {_num(resumen.actualizadas)} actualizadas · "
+            f"estados: {estados}"
         )
 
-    if fallos:
+    if resumen.fallos:
         print("\nIncidencias:")
-        for nombre, detalle in fallos[:20]:
+        for nombre, detalle in resumen.fallos[:20]:
             print(f"  - {nombre}: {detalle[:180]}")
 
-    if not args.dry_run and totales["nuevas"] + totales["actualizadas"] == 0:
+    if not resumen.dry_run and resumen.guardadas == 0:
         _error("No se ha guardado ninguna noticia. Revisa la conexión y los avisos.")
         return 1
     return 0

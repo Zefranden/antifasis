@@ -42,6 +42,8 @@ class ResultadoMedio:
     iniciada_en: Optional[datetime] = None
     finalizada_en: Optional[datetime] = None
     duracion_ms: int = 0
+    nuevas: int = 0
+    actualizadas: int = 0
 
     @property
     def total(self) -> int:

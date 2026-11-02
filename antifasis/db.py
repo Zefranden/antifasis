@@ -62,23 +62,54 @@ def _mensaje_conexion(exc: Exception) -> str:
         )
     if "Connection refused" in detalle or "could not connect" in detalle.lower():
         return (
-            "No se puede conectar a PostgreSQL. ¿Está arrancado?\n"
-            "  docker compose up -d db\n"
+            "No se puede conectar a PostgreSQL. Revisa DATABASE_URL y que el servidor\n"
+            "sea accesible (en local: docker compose up -d db).\n"
             f"Detalle: {detalle}"
         )
     return f"No se pudo conectar a PostgreSQL: {detalle}"
+
+
+def preparar_dsn(dsn: str) -> str:
+    """Valida la DSN y la adapta a Supabase.
+
+    - Elimina ``pgbouncer=true``: es un parámetro de otros clientes que libpq
+      rechaza, aunque la cadena del pooler de Supabase lo incluya.
+    - Añade ``sslmode=require`` si el host es de Supabase y no viene indicado.
+    """
+    texto = (dsn or "").strip()
+    if not texto:
+        raise ErrorBaseDatos("DATABASE_URL no está definida.")
+
+    if "?" in texto:
+        base, consulta = texto.split("?", 1)
+        parametros = [
+            parametro
+            for parametro in consulta.split("&")
+            if parametro and not parametro.lower().startswith("pgbouncer=")
+        ]
+        texto = base + (("?" + "&".join(parametros)) if parametros else "")
+
+    minusculas = texto.lower()
+    if "supabase." in minusculas and "sslmode=" not in minusculas:
+        separador = "&" if "?" in texto else "?"
+        texto = f"{texto}{separador}sslmode=require"
+    return texto
 
 
 class BaseDatos:
     """Conexión única; las escrituras se agrupan en transacciones por medio."""
 
     def __init__(self, dsn: str):
+        self.dsn = preparar_dsn(dsn)
         try:
             self.conn = psycopg.connect(
-                dsn,
+                self.dsn,
                 connect_timeout=10,
                 row_factory=dict_row,
                 autocommit=True,
+                # Supabase puede usar PgBouncer en modo transacción, que no
+                # admite sentencias preparadas entre transacciones.
+                prepare_threshold=None,
             )
         except psycopg.OperationalError as exc:
             raise ErrorBaseDatos(_mensaje_conexion(exc)) from exc

@@ -1,0 +1,43 @@
+services:
+  - type: web
+    name: antifasis-api
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: >-
+      gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 1 --threads 4
+      --timeout 120 --access-logfile -
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: ANTIFASIS_API_TOKEN
+        generateValue: true
+      - key: ANTIFASIS_AUTO_INIT
+        value: "true"
+      - key: ANTIFASIS_ZONA
+        value: Europe/Madrid
+      - key: ANTIFASIS_LIMITE
+        value: "100"
+      - key: ANTIFASIS_DIAS_MAX
+        value: "30"
+      - key: PYTHON_VERSION
+        value: 3.12.7
+
+  - type: cron
+    name: antifasis-cron
+    runtime: python
+    schedule: "0 6,18 * * *"
+    buildCommand: "true"
+    startCommand: "bash scripts/render_cron.sh"
+    envVars:
+      - key: ANTIFASIS_API_HOST
+        fromService:
+          type: web
+          name: antifasis-api
+          property: host
+      - key: ANTIFASIS_API_TOKEN
+        fromService:
+          type: web
+          name: antifasis-api
+          envVarKey: ANTIFASIS_API_TOKEN
